@@ -8,7 +8,8 @@ on:
 
 jobs:
   build-ios-ipa:
-    runs-on: macos-15
+    # macOS arm64 托管运行器常因容量不足排队 15 分钟后失败；intel 运行器可用
+    runs-on: macos-15-intel
     timeout-minutes: 90
     steps:
       - name: Checkout
