@@ -120,13 +120,16 @@ class Http {
 
     if (result.success) return result;
 
-    // 登录态失效（401 / HTML 登录页）与网络异常的判定
-    final bool authFailure = result.needRelogin && !result.isNetworkError;
-    final int retryLimit =
-        result.isNetworkError ? maxNetworkAttempts : maxRetries;
+    // 登录态失效（401 / HTML 登录页）、网络异常、响应格式异常的分类
+    final bool formatError = result.isFormatError;
+    final bool authFailure =
+        result.needRelogin && !result.isNetworkError && !formatError;
+    final int retryLimit = formatError
+        ? 1
+        : (result.isNetworkError ? maxNetworkAttempts : maxRetries);
 
     // 业务错误（4xx/5xx 明确返回、参数错误等）重试也没用，直接返回
-    if (!result.isNetworkError && !authFailure) {
+    if (!result.isNetworkError && !authFailure && !formatError) {
       return result;
     }
 
@@ -150,7 +153,8 @@ class Http {
     }
 
     // 2) 重试用尽：用保存的账号密码静默登录一次，再试最后一回
-    if (!forcedRelogin) {
+    //    （响应格式异常与登录态无关，不做账号密码重登）
+    if (!forcedRelogin && !formatError) {
       final bool ok = await silentReLogin();
       if (ok) {
         _rebuildDio();
@@ -921,7 +925,7 @@ class Http {
       if (isNetworkError) {
         return HttpResponse<T>(
           success: false,
-          message: "网络连接异常，正在重试...",
+          message: "网络连接异常，请检查网络或面板地址",
           code: -1000,
           needRelogin: true,
           isNetworkError: true,
@@ -1000,7 +1004,7 @@ class Http {
               code: -1000,
               message: "服务器返回空响应",
               needRelogin: true,
-              isNetworkError: true,
+              isFormatError: true,
             );
           }
           // 先尝试 JSON 解析：脚本/日志等读取接口的 data 字段可能是源码文本，
@@ -1031,7 +1035,7 @@ class Http {
               code: -1000,
               message: "服务器响应格式异常",
               needRelogin: true,
-              isNetworkError: true,
+              isFormatError: true,
             );
           }
         }
@@ -1043,7 +1047,7 @@ class Http {
             code: -1000,
             message: "服务器响应格式异常",
             needRelogin: true,
-            isNetworkError: true,
+            isFormatError: true,
           );
         }
         if (data["code"] == 200) {
@@ -1116,7 +1120,7 @@ class Http {
           code: -1000,
           message: "服务器响应格式异常",
           needRelogin: true,
-          isNetworkError: true,
+          isFormatError: true,
         );
       }
     } else {
@@ -1147,6 +1151,11 @@ class HttpResponse<T> {
   /// 被要求重新登录（历史问题）。
   bool isNetworkError;
 
+  /// 标记失败原因是「响应格式异常 / 空响应」（连接池死连接、被网关截断等）。
+  /// 这类失败重试一次通常就能恢复，但绝不该重试 3 次（首屏会白等数秒），
+  /// 也绝不该弹「重新登录」。
+  bool isFormatError;
+
   HttpResponse({
     required this.success,
     this.message,
@@ -1154,6 +1163,7 @@ class HttpResponse<T> {
     this.bean,
     this.needRelogin = false,
     this.isNetworkError = false,
+    this.isFormatError = false,
   });
 }
 

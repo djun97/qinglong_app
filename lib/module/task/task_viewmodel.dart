@@ -40,7 +40,8 @@ class TaskViewModel extends BaseViewModel {
     final tasks = await _fetchTasks(context);
     if (tasks == null) {
       list.clear();
-      failed(null, notify: true);
+      // 把真实失败原因显示出来（接口不存在/登录失效/网络异常等），便于定位
+      failed(lastFailReason ?? "加载失败", notify: true);
       return;
     }
     list.clear();
@@ -57,25 +58,51 @@ class TaskViewModel extends BaseViewModel {
     }
   }
 
-  /// 按青龙版本分支拉取任务列表（成功返回解析后的列表，失败返回 null）。
-  Future<List<TaskBean>?> _fetchTasks(BuildContext context) {
-    if (getIt<SystemBean>(
-      instanceName: (SingleAccountPageState.of(context)?.index ?? 0).toString(),
-    ).isUpperVersion2_13_9()) {
-      return SingleAccountPageState.ofApi(context).crons2_13_09().then((temp) {
-        if (temp.success && temp.bean != null) {
-          return temp.bean!.data ?? [];
-        }
-        return null;
-      });
-    } else {
-      return SingleAccountPageState.ofApi(context).crons().then((result) {
-        if (result.success && result.bean != null) {
-          return result.bean!;
-        }
-        return null;
-      });
+  /// 最近一次拉取失败的原始原因（展示到 FAILED 态，便于定位问题）
+  String? lastFailReason;
+
+  /// 拉取任务列表（成功返回解析后的列表，失败返回 null 并写入 [lastFailReason]）
+  ///
+  /// 青龙 2.13.9 起 /crons 返回分页结构 `{data:{data:[],total}}`，之前是
+  /// `{data:[]}`。首屏加载时面板版本常常还没取到（默认按 2.13.0 处理），
+  /// 此时在老版本判断下用错接口形态会被判成「响应格式异常」直接失败 ——
+  /// 所以这里两种形态互为兜底，任一成功即用。
+  Future<List<TaskBean>?> _fetchTasks(BuildContext context) async {
+    lastFailReason = null;
+
+    final bool upper =
+        getIt<SystemBean>(
+          instanceName:
+              (SingleAccountPageState.of(context)?.index ?? 0).toString(),
+        ).isUpperVersion2_13_9();
+
+    List<TaskBean>? tasks =
+        upper ? await _fetchPaged(context) : await _fetchLegacy(context);
+    if (tasks != null) return tasks;
+
+    // 兜底：换另一种接口形态再试一次
+    tasks = upper ? await _fetchLegacy(context) : await _fetchPaged(context);
+    return tasks;
+  }
+
+  /// 2.13.9+ 分页接口
+  Future<List<TaskBean>?> _fetchPaged(BuildContext context) async {
+    final temp = await SingleAccountPageState.ofApi(context).crons2_13_09();
+    if (temp.success && temp.bean != null) {
+      return temp.bean!.data ?? [];
     }
+    lastFailReason ??= temp.message;
+    return null;
+  }
+
+  /// 2.13.9 之前的老接口
+  Future<List<TaskBean>?> _fetchLegacy(BuildContext context) async {
+    final result = await SingleAccountPageState.ofApi(context).crons();
+    if (result.success && result.bean != null) {
+      return result.bean!;
+    }
+    lastFailReason ??= result.message;
+    return null;
   }
 
   // ------------------------------------------------------------------
