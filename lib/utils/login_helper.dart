@@ -5,6 +5,7 @@ import 'package:qinglong_app/base/single_account_page.dart';
 import 'package:qinglong_app/base/userinfo_viewmodel.dart';
 import 'package:qinglong_app/module/login/login_bean.dart';
 import 'package:qinglong_app/utils/extension.dart';
+import 'package:qinglong_app/utils/sp_utils.dart';
 
 import '../main.dart';
 
@@ -45,6 +46,9 @@ class LoginHelper {
     }
     if (response.success) {
       loginSuccess(context, response, userName, password);
+      // 等本地落盘后再切页：iOS 上写入走平台通道异步提交，
+      // 立刻切页/退后台可能丢 token 与凭证（重启后又要重新登录）
+      await SpUtil.flush();
       return success;
     } else if (loginByUserName() && response.code == 401) {
       //可能用户使用的是老版本qinglong
@@ -53,6 +57,7 @@ class LoginHelper {
       ).loginOld(userName, password);
       if (oldResponse.success) {
         loginSuccess(context, oldResponse, userName, password);
+        await SpUtil.flush();
         return success;
       } else {
         (oldResponse.message ?? "请检查网络情况").toast();
@@ -79,6 +84,7 @@ class LoginHelper {
     ).loginTwo(userName, password, code);
     if (response.success) {
       loginSuccess(context, response, userName, password);
+      await SpUtil.flush();
       return success;
     } else {
       (response.message ?? "请检查网络情况").toast();

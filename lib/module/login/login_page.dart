@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -59,7 +61,12 @@ class _LoginPageState extends ConsumerState<LoginPage> {
   final TextEditingController _cSecretController = TextEditingController();
   GlobalKey<FlipCardState> cardKey = GlobalKey<FlipCardState>();
 
-  bool rememberPassword = false;
+  /// 是否记住密码（同时决定能否静默刷新 token）
+  ///
+  /// iOS 默认开启：iOS 上 token 失效后若无本地凭证，冷启动只能弹「重新登录」，
+  /// 用户每次打开都要手动登录。默认记住密码后，token 过期会自动静默换取新
+  /// token，界面上再无感知。Android 保持原有默认（不勾选），可手动开启。
+  bool rememberPassword = Platform.isIOS;
 
   @override
   void initState() {

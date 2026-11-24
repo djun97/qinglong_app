@@ -31,6 +31,15 @@ class Http {
   String host;
   int index;
 
+  /// 网络/链路异常（非登录态失效）的退避重试次数。
+  ///
+  /// 只在幂等的 GET 上展开（1s → 3s），写操作仍保持原有的单次重试，
+  /// 避免网络抖动导致任务被重复提交。冷启动首个请求失败不再提示重新登录。
+  static const int maxNetworkRetries = 2;
+
+  static Duration networkBackoff(int attempt) =>
+      Duration(milliseconds: attempt == 0 ? 1000 : 3000);
+
   Http(this.host, this.index) {
     _init();
   }
@@ -75,6 +84,7 @@ class Http {
     bool useCache = true,
     Duration? ttl,
     bool reloginRetry = false,
+    int netRetry = 0,
   }) async {
     try {
       _init();
@@ -113,8 +123,24 @@ class Http {
         );
       }
 
-      // 重试仍失败且 needRelogin=true：说明 token 确实失效，跳转登录页
-      if (result.needRelogin && reloginRetry) {
+      // 网络/链路异常（不是登录态失效）：指数退避重试，绝不弹「重新登录」
+      // iOS 冷启动首个请求常因 Wi-Fi/VPN 尚未就绪直接失败，退避几秒即可恢复
+      if (result.isNetworkError && netRetry < maxNetworkRetries) {
+        await Future.delayed(networkBackoff(netRetry));
+        _rebuildDio();
+        return get<T>(
+          uri,
+          json,
+          compute: compute,
+          serializationName: serializationName,
+          useCache: false,
+          reloginRetry: reloginRetry,
+          netRetry: netRetry + 1,
+        );
+      }
+
+      // 重试仍失败且 needRelogin=true 且确属登录态失效：才跳转登录页
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
 
@@ -139,9 +165,24 @@ class Http {
           serializationName: serializationName,
           useCache: false,
           reloginRetry: true,
+          netRetry: netRetry,
         );
       }
-      if (result.needRelogin && reloginRetry) {
+      // 网络/链路异常：退避重试，不弹「重新登录」
+      if (result.isNetworkError && netRetry < maxNetworkRetries) {
+        await Future.delayed(networkBackoff(netRetry));
+        _rebuildDio();
+        return get<T>(
+          uri,
+          json,
+          compute: compute,
+          serializationName: serializationName,
+          useCache: false,
+          reloginRetry: reloginRetry,
+          netRetry: netRetry + 1,
+        );
+      }
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
       return result;
@@ -225,7 +266,7 @@ class Http {
           reloginRetry: true,
         );
       }
-      if (result.needRelogin && reloginRetry) {
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
 
@@ -242,7 +283,7 @@ class Http {
           reloginRetry: true,
         );
       }
-      if (result.needRelogin && reloginRetry) {
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
       return result;
@@ -280,7 +321,7 @@ class Http {
           reloginRetry: true,
         );
       }
-      if (result.needRelogin && reloginRetry) {
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
 
@@ -297,7 +338,7 @@ class Http {
           reloginRetry: true,
         );
       }
-      if (result.needRelogin && reloginRetry) {
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
       return result;
@@ -335,7 +376,7 @@ class Http {
           reloginRetry: true,
         );
       }
-      if (result.needRelogin && reloginRetry) {
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
 
@@ -352,7 +393,7 @@ class Http {
           reloginRetry: true,
         );
       }
-      if (result.needRelogin && reloginRetry) {
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
       return result;
@@ -649,7 +690,7 @@ class Http {
           sendTimeout: sendTimeout,
         );
       }
-      if (result.needRelogin && reloginRetry) {
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
 
@@ -667,7 +708,7 @@ class Http {
           sendTimeout: sendTimeout,
         );
       }
-      if (result.needRelogin && reloginRetry) {
+      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
         exitLogin();
       }
       return result;
@@ -744,10 +785,12 @@ class Http {
     }
 
     // 弹窗让用户选择：重新登录 或 取消（留在当前页面）
+    // 注意：只有登录态确实失效（401 / HTML 登录页，且静默刷新失败）才会走到这里；
+    // 网络异常不再弹本弹窗，改为退避重试后给失败提示。
     final shouldLogin = await showConfirmDialog(
       context,
-      title: '连接失败',
-      content: '网络连接失败，是否重新登录？',
+      title: '登录已失效',
+      content: '登录状态已失效，是否重新登录？',
       cancelLabel: '取消',
       confirmLabel: '重新登录',
       danger: false,
@@ -925,9 +968,9 @@ class Http {
         );
       }
 
-      // 网络错误（死连接 / 超时 / 连接失败）：标记 needRelogin 触发重建 Dio + 重试
+      // 网络错误（死连接 / 超时 / 连接失败）：与登录态无关，只重建 Dio + 重试
       // 长时间不活动后 Dio keep-alive 连接失效，表现为 connectionTimeout / receiveTimeout / connectionError
-      // 重建 Dio 清空连接池后重试即可恢复，无需用户重启 app
+      // 冷启动（iOS 刚唤醒、Wi-Fi/VPN 未就绪）也会走到这里
       final isNetworkError =
           e.type == DioExceptionType.connectionTimeout ||
           e.type == DioExceptionType.sendTimeout ||
@@ -940,6 +983,7 @@ class Http {
           message: "网络连接异常，正在重试...",
           code: -1000,
           needRelogin: true,
+          isNetworkError: true,
         );
       }
 
@@ -1015,6 +1059,7 @@ class Http {
               code: -1000,
               message: "服务器返回空响应",
               needRelogin: true,
+              isNetworkError: true,
             );
           }
           // 先尝试 JSON 解析：脚本/日志等读取接口的 data 字段可能是源码文本，
@@ -1039,12 +1084,13 @@ class Http {
                 needRelogin: true,
               );
             }
-            // 非 JSON 非 HTML 的异常格式：触发重建 Dio + 静默刷新 + 重试
+            // 非 JSON 非 HTML 的异常格式：触发重建 Dio + 重试
             return HttpResponse<T>(
               success: false,
               code: -1000,
               message: "服务器响应格式异常",
               needRelogin: true,
+              isNetworkError: true,
             );
           }
         }
@@ -1056,6 +1102,7 @@ class Http {
             code: -1000,
             message: "服务器响应格式异常",
             needRelogin: true,
+            isNetworkError: true,
           );
         }
         if (data["code"] == 200) {
@@ -1128,6 +1175,7 @@ class Http {
           code: -1000,
           message: "服务器响应格式异常",
           needRelogin: true,
+          isNetworkError: true,
         );
       }
     } else {
@@ -1150,12 +1198,21 @@ class HttpResponse<T> {
   /// 标记响应被识别为 token 失效（HTML 登录页 / 401），需触发静默刷新
   bool needRelogin;
 
+  /// 标记失败原因是「网络/链路异常」而非登录态失效。
+  ///
+  /// 冷启动（尤其 iOS 刚唤醒、Wi-Fi/VPN 尚未就绪）时首个请求常常直接
+  /// connectionError/超时，响应体为空或非 JSON。这类失败与 token 无关，
+  /// 重试即可恢复，绝不能弹「是否重新登录」——否则用户每次冷启动都会
+  /// 被要求重新登录（历史问题）。
+  bool isNetworkError;
+
   HttpResponse({
     required this.success,
     this.message,
     required this.code,
     this.bean,
     this.needRelogin = false,
+    this.isNetworkError = false,
   });
 }
 

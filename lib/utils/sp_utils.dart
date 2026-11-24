@@ -30,10 +30,32 @@ class SpUtil {
     _prefs = await SharedPreferences.getInstance();
   }
 
+  /// 挂起的写入任务：SharedPreferences 的写入经平台通道异步落盘，
+  /// iOS 上登录成功后立刻切页/退后台，写入可能还没 commit，重启即丢 token。
+  /// 关键流程（登录成功）用 [flush] 等一次落盘。
+  static final List<Future> _pendingWrites = [];
+
+  static void _track(Future? f) {
+    if (f == null) return;
+    _pendingWrites.add(f);
+  }
+
+  /// 等待所有挂起写入完成
+  static Future<void> flush() async {
+    while (_pendingWrites.isNotEmpty) {
+      final Future f = _pendingWrites.removeAt(0);
+      try {
+        await f;
+      } catch (_) {}
+    }
+  }
+
   /// put object.
   static Future<bool>? putObject(String key, Object value) {
     if (_prefs == null) return null;
-    return _prefs!.setString(key, json.encode(value));
+    final f = _prefs!.setString(key, json.encode(value));
+    _track(f);
+    return f;
   }
 
   /// get obj.
@@ -55,7 +77,9 @@ class SpUtil {
     List<String> dataList = list.map((value) {
       return json.encode(value);
     }).toList();
-    return _prefs!.setStringList(key, dataList);
+    final f = _prefs!.setStringList(key, dataList);
+    _track(f);
+    return f;
   }
 
   /// get obj list.
@@ -86,7 +110,9 @@ class SpUtil {
   /// put string.
   static Future<bool>? putString(String key, String value) {
     if (_prefs == null) return null;
-    return _prefs!.setString(key, value);
+    final f = _prefs!.setString(key, value);
+    _track(f);
+    return f;
   }
 
   /// get bool.
@@ -98,7 +124,9 @@ class SpUtil {
   /// put bool.
   static Future<bool>? putBool(String key, bool value) {
     if (_prefs == null) return null;
-    return _prefs!.setBool(key, value);
+    final f = _prefs!.setBool(key, value);
+    _track(f);
+    return f;
   }
 
   /// get int.
@@ -110,7 +138,9 @@ class SpUtil {
   /// put int.
   static Future<bool>? putInt(String key, int value) {
     if (_prefs == null) return null;
-    return _prefs!.setInt(key, value);
+    final f = _prefs!.setInt(key, value);
+    _track(f);
+    return f;
   }
 
   /// get double.
@@ -122,7 +152,9 @@ class SpUtil {
   /// put double.
   static Future<bool>? putDouble(String key, double value) {
     if (_prefs == null) return null;
-    return _prefs!.setDouble(key, value);
+    final f = _prefs!.setDouble(key, value);
+    _track(f);
+    return f;
   }
 
   /// get string list.
@@ -134,7 +166,9 @@ class SpUtil {
   /// put string list.
   static Future<bool>? putStringList(String key, List<String> value) {
     if (_prefs == null) return null;
-    return _prefs!.setStringList(key, value);
+    final f = _prefs!.setStringList(key, value);
+    _track(f);
+    return f;
   }
 
   /// get dynamic.
