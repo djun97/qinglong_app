@@ -207,9 +207,10 @@ class SingleAccountPageState extends State<SingleAccountPage> {
     registerProvider();
     if (getIt<MultiAccountUserInfoViewModel>().tokenBeans.isNotEmpty && getIt<MultiAccountUserInfoViewModel>().tokenBeans.length > widget.index) {
       var bean = getIt<MultiAccountUserInfoViewModel>().tokenBeans[index];
-      UserInfoBean history = getIt<MultiAccountUserInfoViewModel>().historyAccounts.firstWhere((element) => element.host == bean.host, orElse: () {
-        return UserInfoBean();
-      });
+      // 精确→归一化→单账号兜底，避免地址写法差异导致拿不到账号密码（静默登录失效）
+      UserInfoBean history =
+          getIt<MultiAccountUserInfoViewModel>().findHistoryAccount(bean.host) ??
+          UserInfoBean();
       UserInfoViewModel userInfoViewModel = UserInfoViewModel(
         token: bean.token,
         useSecret: bean.useSecretLogined,

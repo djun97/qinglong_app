@@ -71,6 +71,40 @@ class MultiAccountUserInfoViewModel {
     }
   }
 
+  /// 地址归一化：去 scheme、去尾部斜杠、小写，用于宽松比对历史账号
+  static String _normHost(String? raw) {
+    var h = (raw ?? '').trim().toLowerCase();
+    if (h.startsWith('https://')) h = h.substring(8);
+    if (h.startsWith('http://')) h = h.substring(7);
+    while (h.endsWith('/')) {
+      h = h.substring(0, h.length - 1);
+    }
+    return h;
+  }
+
+  /// 按 host 查找历史账号（本地凭证来源）
+  ///
+  /// 依次尝试：精确匹配 → 归一化地址匹配 → 只有一个历史账号时兜底。
+  /// 早期版本未记住密码、或地址写法不同（带/不带 http://、IPv6 方括号）
+  /// 时精确匹配会失败，导致「静默重新登录」永远拿不到账号密码。
+  UserInfoBean? findHistoryAccount(String? host) {
+    if (historyAccounts.isEmpty) return null;
+
+    final String h = (host ?? '').trim();
+    if (h.isNotEmpty) {
+      for (final bean in historyAccounts) {
+        if (bean.host == h) return bean;
+      }
+      final String target = _normHost(h);
+      for (final bean in historyAccounts) {
+        if (_normHost(bean.host) == target) return bean;
+      }
+    }
+
+    if (historyAccounts.length == 1) return historyAccounts.first;
+    return null;
+  }
+
   void save2HistoryAccount(UserInfoBean userInfoBean) {
     //如果已经存在host，那就更�?
 

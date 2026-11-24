@@ -12,6 +12,7 @@ import 'package:qinglong_app/base/http/http_cache.dart';
 import 'package:qinglong_app/base/http/token_interceptor.dart';
 import 'package:qinglong_app/base/http/url.dart';
 import 'package:qinglong_app/base/ui/confirm_dialog.dart';
+import 'package:qinglong_app/base/multi_account_userinfo_viewmodel.dart';
 import 'package:qinglong_app/base/userinfo_viewmodel.dart';
 import 'package:qinglong_app/utils/extension.dart';
 
@@ -30,15 +31,6 @@ class Http {
 
   String host;
   int index;
-
-  /// 网络/链路异常（非登录态失效）的退避重试次数。
-  ///
-  /// 只在幂等的 GET 上展开（1s → 3s），写操作仍保持原有的单次重试，
-  /// 避免网络抖动导致任务被重复提交。冷启动首个请求失败不再提示重新登录。
-  static const int maxNetworkRetries = 2;
-
-  static Duration networkBackoff(int attempt) =>
-      Duration(milliseconds: attempt == 0 ? 1000 : 3000);
 
   Http(this.host, this.index) {
     _init();
@@ -76,28 +68,40 @@ class Http {
     HttpCache.clearAccount(index);
   }
 
-  Future<HttpResponse<T>> get<T>(
-    String uri,
-    Map<String, String?>? json, {
-    bool compute = true,
-    String serializationName = "data",
-    bool useCache = true,
-    Duration? ttl,
-    bool reloginRetry = false,
-    int netRetry = 0,
+  /// 自动重试次数（用户要求：失败自动重试 3 次）
+  static const int maxRetries = 3;
+
+  /// 写操作（POST/PUT/DELETE）在「网络类失败」下的重试上限。
+  /// 网络失败时无法确定服务端是否已执行，重试过多可能重复提交；
+  /// 登录态失效（401 / HTML 登录页）说明请求一定没执行，仍按 [maxRetries] 重试。
+  static const int maxNetworkRetriesForWrite = 1;
+
+  /// 退避间隔：第 1 次 1s、第 2 次 2s、第 3 次 3s
+  static Duration retryBackoff(int attempt) =>
+      Duration(milliseconds: 1000 * (attempt + 1));
+
+  /// 带自动重试的请求执行器（GET/POST/PUT/DELETE 共用）
+  ///
+  /// 一次完整流程：
+  /// 1. 用当前 token 发原请求；
+  /// 2. 失败则自动重试，最多 3 次，退避 1s/2s/3s，每次重建 Dio 清死连接；
+  ///    若判定为登录态失效，顺便用本地凭证静默换一次 token；
+  /// 3. 3 次重试都失败后，用本地保存的账号密码静默登录一次，再请求最后一回；
+  /// 4. 仍然失败：只有登录态确实失效才提示用户重新登录，
+  ///    网络类失败只返回失败结果（绝不因为断网/冷启动网络未就绪就要求重新登录）。
+  Future<HttpResponse<T>> _executeWithRetry<T>(
+    String uri, {
+    required Future<Response<dynamic>> Function() send,
+    required bool compute,
+    required String serializationName,
+    int attempt = 0,
+    int maxNetworkAttempts = maxRetries,
+    bool forcedRelogin = false,
   }) async {
+    HttpResponse<T> result;
     try {
       _init();
-
-      final cacheKey = _buildCacheKey(uri, json);
-      if (useCache) {
-        final cached = HttpCache(index).get<HttpResponse<T>>(cacheKey);
-        if (cached != null) {
-          return cached;
-        }
-      }
-
-      var response = await _dio!.get(uri, queryParameters: json);
+      final response = await send();
       // 大响应(>= 256KB)在 Isolate 中预解析 JSON,避免主线程卡顿
       // 主要场景:大脚本内容、大日志详情
       if (response.data is String) {
@@ -106,90 +110,103 @@ class Http {
           response.data = await foundation.compute(_decodeJsonInIsolate, raw);
         }
       }
-      var result = decodeResponse<T>(response, serializationName, compute);
-
-      // token 失效（HTML 登录页）/ 解析异常 / Dio 死连接：
-      // 重建 Dio + 静默刷新 token，然后无论如何都重试一次
-      // 即使 silentReLogin 失败（如未记住密码），Dio 已重建，重试可能直接成功
-      if (result.needRelogin && !reloginRetry) {
-        await _handleTokenExpired();
-        return get<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          useCache: false,
-          reloginRetry: true,
-        );
-      }
-
-      // 网络/链路异常（不是登录态失效）：指数退避重试，绝不弹「重新登录」
-      // iOS 冷启动首个请求常因 Wi-Fi/VPN 尚未就绪直接失败，退避几秒即可恢复
-      if (result.isNetworkError && netRetry < maxNetworkRetries) {
-        await Future.delayed(networkBackoff(netRetry));
-        _rebuildDio();
-        return get<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          useCache: false,
-          reloginRetry: reloginRetry,
-          netRetry: netRetry + 1,
-        );
-      }
-
-      // 重试仍失败且 needRelogin=true 且确属登录态失效：才跳转登录页
-      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
-        exitLogin();
-      }
-
-      if (useCache && result.success) {
-        // 优先使用调用方显式传入的 ttl,否则按 URI 推断分级 TTL
-        final effectiveTtl = ttl ?? CacheTtl.forUri(uri);
-        HttpCache(
-          index,
-        ).set<HttpResponse<T>>(cacheKey, result, ttl: effectiveTtl);
-      }
-
-      return result;
+      result = decodeResponse<T>(response, serializationName, compute);
     } on DioException catch (e) {
-      final result = exceptionHandler<T>(e, uri);
-      // 401 也走静默刷新重试
-      if (result.needRelogin && !reloginRetry) {
-        await _handleTokenExpired();
-        return get<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          useCache: false,
-          reloginRetry: true,
-          netRetry: netRetry,
-        );
-      }
-      // 网络/链路异常：退避重试，不弹「重新登录」
-      if (result.isNetworkError && netRetry < maxNetworkRetries) {
-        await Future.delayed(networkBackoff(netRetry));
-        _rebuildDio();
-        return get<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          useCache: false,
-          reloginRetry: reloginRetry,
-          netRetry: netRetry + 1,
-        );
-      }
-      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
-        exitLogin();
-      }
-      return result;
+      result = exceptionHandler<T>(e, uri);
     } catch (e) {
       logger.e(e);
       return HttpResponse<T>(success: false, code: -1000, message: "请求失败");
     }
+
+    if (result.success) return result;
+
+    // 登录态失效（401 / HTML 登录页）与网络异常的判定
+    final bool authFailure = result.needRelogin && !result.isNetworkError;
+    final int retryLimit =
+        result.isNetworkError ? maxNetworkAttempts : maxRetries;
+
+    // 业务错误（4xx/5xx 明确返回、参数错误等）重试也没用，直接返回
+    if (!result.isNetworkError && !authFailure) {
+      return result;
+    }
+
+    // 1) 自动重试
+    if (attempt < retryLimit) {
+      await Future.delayed(retryBackoff(attempt));
+      _rebuildDio();
+      if (authFailure) {
+        // 登录态疑似失效：有本地凭证就顺手换一个新 token
+        await silentReLogin();
+      }
+      return _executeWithRetry<T>(
+        uri,
+        send: send,
+        compute: compute,
+        serializationName: serializationName,
+        attempt: attempt + 1,
+        maxNetworkAttempts: maxNetworkAttempts,
+        forcedRelogin: forcedRelogin,
+      );
+    }
+
+    // 2) 重试用尽：用保存的账号密码静默登录一次，再试最后一回
+    if (!forcedRelogin) {
+      final bool ok = await silentReLogin();
+      if (ok) {
+        _rebuildDio();
+        return _executeWithRetry<T>(
+          uri,
+          send: send,
+          compute: compute,
+          serializationName: serializationName,
+          attempt: attempt,
+          maxNetworkAttempts: maxNetworkAttempts,
+          forcedRelogin: true,
+        );
+      }
+    }
+
+    // 3) 仍失败：只有登录态确实失效才提示重新登录
+    if (authFailure) {
+      exitLogin();
+    }
+    return result;
+  }
+
+  Future<HttpResponse<T>> get<T>(
+    String uri,
+    Map<String, String?>? json, {
+    bool compute = true,
+    String serializationName = "data",
+    bool useCache = true,
+    Duration? ttl,
+    bool reloginRetry = false,
+  }) async {
+    final cacheKey = _buildCacheKey(uri, json);
+    if (useCache) {
+      final cached = HttpCache(index).get<HttpResponse<T>>(cacheKey);
+      if (cached != null) {
+        return cached;
+      }
+    }
+
+    final result = await _executeWithRetry<T>(
+      uri,
+      send: () => _dio!.get(uri, queryParameters: json),
+      compute: compute,
+      serializationName: serializationName,
+      maxNetworkAttempts: maxRetries,
+    );
+
+    if (useCache && result.success) {
+      // 优先使用调用方显式传入的 ttl,否则按 URI 推断分级 TTL
+      final effectiveTtl = ttl ?? CacheTtl.forUri(uri);
+      HttpCache(
+        index,
+      ).set<HttpResponse<T>>(cacheKey, result, ttl: effectiveTtl);
+    }
+
+    return result;
   }
 
   String _buildCacheKey(String uri, Map<String, String?>? json) {
@@ -243,51 +260,20 @@ class Http {
     bool reloginRetry = false,
     Duration? receiveTimeout,
   }) async {
-    try {
-      _init();
-      var response = await _dio!.post(
+    _init();
+    final result = await _executeWithRetry<T>(
+      uri,
+      send: () => _dio!.post(
         uri,
         data: json,
         options: Options(receiveTimeout: receiveTimeout),
-      );
-
-      _invalidateRelatedCache(uri);
-
-      var result = decodeResponse<T>(response, serializationName, compute);
-
-      // token 失效 / 解析异常 / Dio 死连接：重建 Dio + 静默刷新 + 重试一次
-      if (result.needRelogin && !reloginRetry) {
-        await _handleTokenExpired();
-        return post<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          reloginRetry: true,
-        );
-      }
-      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
-        exitLogin();
-      }
-
-      return result;
-    } on DioException catch (e) {
-      final result = exceptionHandler<T>(e, uri);
-      if (result.needRelogin && !reloginRetry) {
-        await _handleTokenExpired();
-        return post<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          reloginRetry: true,
-        );
-      }
-      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
-        exitLogin();
-      }
-      return result;
-    }
+      ),
+      compute: compute,
+      serializationName: serializationName,
+      maxNetworkAttempts: maxNetworkRetriesForWrite,
+    );
+    _invalidateRelatedCache(uri);
+    return result;
   }
 
   Future<HttpResponse<T>> delete<T>(
@@ -298,51 +284,20 @@ class Http {
     bool reloginRetry = false,
     Duration? receiveTimeout,
   }) async {
-    try {
-      _init();
-      var response = await _dio!.delete(
+    _init();
+    final result = await _executeWithRetry<T>(
+      uri,
+      send: () => _dio!.delete(
         uri,
         data: json,
         options: Options(receiveTimeout: receiveTimeout),
-      );
-
-      _invalidateRelatedCache(uri);
-
-      var result = decodeResponse<T>(response, serializationName, compute);
-
-      // token 失效 / 解析异常 / Dio 死连接：重建 Dio + 静默刷新 + 重试一次
-      if (result.needRelogin && !reloginRetry) {
-        await _handleTokenExpired();
-        return delete<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          reloginRetry: true,
-        );
-      }
-      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
-        exitLogin();
-      }
-
-      return result;
-    } on DioException catch (e) {
-      final result = exceptionHandler<T>(e, uri);
-      if (result.needRelogin && !reloginRetry) {
-        await _handleTokenExpired();
-        return delete<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          reloginRetry: true,
-        );
-      }
-      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
-        exitLogin();
-      }
-      return result;
-    }
+      ),
+      compute: compute,
+      serializationName: serializationName,
+      maxNetworkAttempts: maxNetworkRetriesForWrite,
+    );
+    _invalidateRelatedCache(uri);
+    return result;
   }
 
   Future<HttpResponse<T>> put<T>(
@@ -353,51 +308,20 @@ class Http {
     bool reloginRetry = false,
     Duration? receiveTimeout,
   }) async {
-    try {
-      _init();
-      var response = await _dio!.put(
+    _init();
+    final result = await _executeWithRetry<T>(
+      uri,
+      send: () => _dio!.put(
         uri,
         data: json,
         options: Options(receiveTimeout: receiveTimeout),
-      );
-
-      _invalidateRelatedCache(uri);
-
-      var result = decodeResponse<T>(response, serializationName, compute);
-
-      // token 失效 / 解析异常 / Dio 死连接：重建 Dio + 静默刷新 + 重试一次
-      if (result.needRelogin && !reloginRetry) {
-        await _handleTokenExpired();
-        return put<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          reloginRetry: true,
-        );
-      }
-      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
-        exitLogin();
-      }
-
-      return result;
-    } on DioException catch (e) {
-      final result = exceptionHandler<T>(e, uri);
-      if (result.needRelogin && !reloginRetry) {
-        await _handleTokenExpired();
-        return put<T>(
-          uri,
-          json,
-          compute: compute,
-          serializationName: serializationName,
-          reloginRetry: true,
-        );
-      }
-      if (result.needRelogin && reloginRetry && !result.isNetworkError) {
-        exitLogin();
-      }
-      return result;
-    }
+      ),
+      compute: compute,
+      serializationName: serializationName,
+      maxNetworkAttempts: maxNetworkRetriesForWrite,
+    );
+    _invalidateRelatedCache(uri);
+    return result;
   }
 
   /// 下载二进制流文件（用于数据导出 .tgz 压缩包备份）
@@ -852,9 +776,26 @@ class Http {
     }
   }
 
+  /// 取本地凭证，缺失时从历史账号回填（兼容未记住密码的老数据/地址写法差异）
+  UserInfoViewModel _userInfoWithCredentials() {
+    final userInfo = getIt<UserInfoViewModel>(instanceName: index.toString());
+    final bool hasCredential = userInfo.userName != null &&
+        userInfo.userName!.isNotEmpty &&
+        userInfo.passWord != null &&
+        userInfo.passWord!.isNotEmpty;
+    if (hasCredential) return userInfo;
+
+    final bean = getIt<MultiAccountUserInfoViewModel>()
+        .findHistoryAccount(userInfo.host ?? host);
+    if (bean != null) {
+      userInfo.applyCredentials(bean.userName, bean.password, bean.useSecretLogined);
+    }
+    return userInfo;
+  }
+
   /// 判断本地是否有足够凭证进行静默刷新
   bool _canSilentRelogin() {
-    final userInfo = getIt<UserInfoViewModel>(instanceName: index.toString());
+    final userInfo = _userInfoWithCredentials();
     return userInfo.userName != null &&
         userInfo.userName!.isNotEmpty &&
         userInfo.passWord != null &&
@@ -873,7 +814,7 @@ class Http {
       // 无凭证（未记住密码），无法静默刷新
       if (!_canSilentRelogin()) return false;
 
-      final userInfo = getIt<UserInfoViewModel>(instanceName: index.toString());
+      final userInfo = _userInfoWithCredentials();
 
       // 直接用 Dio 发请求，绕过 decodeResponse 的 HTML 检测，避免递归
       // secret 登录用户用 client_id 方式，密码登录用户用账号密码方式

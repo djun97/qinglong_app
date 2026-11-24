@@ -153,6 +153,18 @@ class UserInfoViewModel {
   void updateHost(String host) {
     _host = host;
   }
+
+  /// 静默登录兜底用：把历史账号里保存的凭证回填到当前会话
+  /// （不写回历史，只补齐内存态，避免登录成功后重复落盘）
+  void applyCredentials(String? userName, String? password, bool useSecret) {
+    if (userName != null && userName.isNotEmpty) {
+      _userName = userName;
+    }
+    if (password != null && password.isNotEmpty) {
+      _passWord = password;
+    }
+    _useSecertLogined = useSecret;
+  }
 }
 
 class UserInfoBean {
